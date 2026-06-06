@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Caches / index data (Stage 2+)
+*.pkl
+*.npy
+*.db
+
+# OS
+Thumbs.db
+.DS_Store

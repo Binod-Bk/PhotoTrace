@@ -1,0 +1,17 @@
+# PhotoTrace — dependencies
+#
+# IMPORTANT (Windows + Python 3.13): the classic `pip install face_recognition`
+# tries to compile `dlib` from source, which needs Visual Studio C++ build
+# tools + CMake and often fails. We avoid that entirely by using `dlib-bin`,
+# which ships a prebuilt dlib wheel (including a Python 3.13 / cp313 build).
+#
+# Because face_recognition declares a hard `dlib` dependency, it must be
+# installed with --no-deps so pip doesn't try to build the source dlib on top
+# of dlib-bin. See README / install commands below.
+
+dlib-bin               # prebuilt dlib engine (provides the importable `dlib`)
+face_recognition==1.3.0
+face_recognition_models==0.3.0
+numpy
+Pillow
+setuptools<81         # face_recognition_models needs pkg_resources, removed in setuptools 81+
