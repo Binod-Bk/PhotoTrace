@@ -52,7 +52,8 @@ python stage1_match.py REFERENCE_IMAGE TARGET_FOLDER [--threshold 0.6]
 ```
 
 - `REFERENCE_IMAGE` — one clear, front-facing photo of the target person.
-- `TARGET_FOLDER` — scanned recursively for `.jpg .jpeg .png .webp`.
+- `TARGET_FOLDER` — scanned recursively for `.jpg .jpeg .png .webp .avif`
+  (AVIF needs Pillow >= 11.3, which bundles libavif; older Pillow skips them).
 - `--threshold` — face *distance* cutoff (lower = stricter). Default `0.6`.
 
 Example:

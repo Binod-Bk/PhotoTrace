@@ -13,3 +13,10 @@ env/
 # OS
 Thumbs.db
 .DS_Store
+
+# Stray test images that may land in the project folder during manual testing
+shah*.jpg
+shah*.jpeg
+shah*.png
+shah*.webp
+shah*.avif

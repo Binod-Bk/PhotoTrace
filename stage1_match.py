@@ -46,7 +46,10 @@ from pathlib import Path
 import face_recognition
 
 # Image formats we will attempt to read. Anything else is skipped.
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+# .avif support depends on Pillow being built with libavif (Pillow >= 11.3
+# bundles it). If your Pillow lacks AVIF support those files are simply
+# skipped as unreadable rather than crashing the run.
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 
 
 # ---------------------------------------------------------------------------
