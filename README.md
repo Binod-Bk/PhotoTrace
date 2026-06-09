@@ -3,8 +3,9 @@
 Find every photo containing a specific person across a folder — including group
 photos — using local, offline face recognition. No network, no cloud.
 
-> **Status: Stage 3** — minimal PyQt6 desktop UI on top of the Stage 2 engine:
-> pick references, index a folder, and browse matches in a thumbnail grid.
+> **Status: Stage 4** — desktop app with file operations: select images,
+> MOVE/COPY them to a folder, and a live confidence slider that re-filters
+> results instantly. Move asks for confirmation; there is no delete.
 
 ## Install (Windows + Python 3.13)
 
@@ -57,10 +58,16 @@ python gui.py
 3. **Index folder** — one-time, runs in the background with a live progress bar.
 4. **Search** — shows matches in a scrollable thumbnail grid, each with a
    confidence score and a checkbox.
+5. **Confidence slider** — drag to re-filter the shown results instantly (no
+   re-search; a search collects every candidate up to a cap and the slider just
+   changes which are displayed).
+6. **Select all / Deselect all**, then **Copy selected…** or **Move selected…**
+   to relocate them to a folder you choose. Move asks for confirmation first;
+   existing names are never overwritten (`(1)`, `(2)`… is appended). There is
+   **no delete** — moving to a folder is the safe alternative.
 
 Indexing and searching run on background threads, so the window stays
 responsive. Thumbnails load through Pillow, so `.webp` / `.avif` previews work.
-(Select-all, move/copy, and a live confidence slider arrive in Stage 4.)
 
 ## Usage (command-line, Stage 2)
 
@@ -95,6 +102,7 @@ cached vectors — typically a few **milliseconds**.
 | `engine.py`       | All face-recognition calls (swap here for InsightFace later)|
 | `cache.py`        | Persistent embedding cache (pickle now; SQLite in Stage 5)  |
 | `phototrace.py`   | CLI: `index` and `search` commands                          |
+| `fileops.py`      | Safe move/copy (no overwrite, no delete, per-file errors)   |
 | `gui.py`          | PyQt6 desktop UI (Stage 3+)                                  |
 | `stage1_match.py` | Stage 1 single-file proof (kept for reference)              |
 

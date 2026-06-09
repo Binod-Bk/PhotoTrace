@@ -1,22 +1,18 @@
 """
-PhotoTrace — STAGE 3: minimal PyQt6 UI
-======================================
+PhotoTrace — STAGE 4: file operations + live confidence slider
+==============================================================
 
-A small desktop window over the Stage 2 engine + cache:
+Builds on the Stage 3 window:
 
-  * Pick 1-3 reference images of ONE person.
-  * Pick a target folder.
-  * INDEX it (slow, runs in a background thread with a live progress bar).
-  * SEARCH (fast) and see matches in a scrollable thumbnail grid, each with a
-    confidence score and a checkbox.
+  * Per-image selection, plus Select all / Deselect all.
+  * MOVE or COPY the selected images to a folder you choose. Move asks for
+    confirmation first (it relocates files); copy does not.
+  * A live confidence slider that re-filters the displayed results instantly —
+    no re-search needed, because a search returns every candidate up to a cap
+    and the slider just changes which ones are shown.
 
-Heavy work (face detection during indexing, and reference encoding during
-search) runs in QThread workers so the window never freezes. Thumbnails are
-loaded through Pillow, so .webp / .avif render even though Qt can't always
-decode them natively.
-
-File operations (move/copy), select-all, and the live confidence slider arrive
-in Stage 4 — the checkboxes here are the groundwork for that.
+Still: no delete (moving to a folder is the safe alternative), heavy work runs
+in background threads, and thumbnails load through Pillow so .webp/.avif render.
 
 Run:
     python gui.py
@@ -25,24 +21,31 @@ Run:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal
 from PyQt6.QtGui import QIcon, QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 from PIL import Image
 
 import engine
 import cache as cache_mod
+import fileops
 
 THUMB_SIZE = 170        # px, square thumbnails in the results grid
 REF_THUMB_SIZE = 84     # px, small thumbnails for chosen references
 GRID_COLUMNS = 4        # results per row
 MAX_REFERENCES = 3
+
+# A search returns every image whose best face distance is <= this cap; the
+# slider then filters within that set. Keeping a cap bounds how much we hold.
+SEARCH_CAP = 0.80
+SLIDER_MIN, SLIDER_MAX, SLIDER_DEFAULT = 30, 80, 60   # represent 0.30..0.80
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +62,6 @@ def load_thumbnail(path: Path, size: int) -> QPixmap | None:
         data = im.tobytes("raw", "RGB")
         qimg = QImage(data, im.width, im.height, im.width * 3,
                       QImage.Format.Format_RGB888)
-        # fromImage copies into the pixmap's own storage, so it's safe after
-        # `data` goes out of scope.
         return QPixmap.fromImage(qimg.copy())
     except Exception:
         return None
@@ -114,18 +115,20 @@ class IndexWorker(QThread):
 
 
 class SearchWorker(QThread):
-    """Encodes references + scans the cache in the background."""
+    """
+    Encodes references + scans the cache in the background. Returns EVERY image
+    whose best distance is <= SEARCH_CAP (sorted best-first) so the UI slider
+    can re-filter live without re-searching.
+    """
     done = pyqtSignal(list, float)          # [(path, distance)], elapsed seconds
     failed = pyqtSignal(str)
 
-    def __init__(self, references: list[Path], cache_path: Path, threshold: float):
+    def __init__(self, references: list[Path], cache_path: Path):
         super().__init__()
         self.references = references
         self.cache_path = cache_path
-        self.threshold = threshold
 
     def run(self):
-        import time
         try:
             cache = cache_mod.load_cache(self.cache_path)
             if not cache["files"]:
@@ -144,18 +147,18 @@ class SearchWorker(QThread):
             target = engine.average_encodings(ref_encodings)
 
             start = time.perf_counter()
-            matches = []
+            candidates = []
             for path_str, record in cache["files"].items():
                 if not record["faces"] or not Path(path_str).exists():
                     continue
                 encodings = [f["embedding"] for f in record["faces"]]
                 best = float(min(engine.face_distance(encodings, target)))
-                if best <= self.threshold:
-                    matches.append((path_str, best))
+                if best <= SEARCH_CAP:
+                    candidates.append((path_str, best))
             elapsed = time.perf_counter() - start
 
-            matches.sort(key=lambda m: m[1])
-            self.done.emit(matches, elapsed)
+            candidates.sort(key=lambda m: m[1])
+            self.done.emit(candidates, elapsed)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -168,13 +171,17 @@ class PhotoTraceWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoTrace")
-        self.resize(900, 720)
+        self.resize(940, 760)
 
         self.reference_paths: list[Path] = []
         self.target_folder: Path | None = None
         self.cache_path = cache_mod.default_cache_path()
-        self.result_checkboxes: list[tuple[str, QCheckBox]] = []
-        self._worker = None  # keep a reference so threads aren't GC'd mid-run
+
+        self.all_candidates: list[tuple[str, float]] = []   # full result set (<= cap)
+        self.visible_checks: list[tuple[str, QCheckBox]] = []  # currently shown cards
+        self.selected_paths: set[str] = set()               # survives re-filtering
+        self._thumb_cache: dict[str, QPixmap] = {}          # path -> grid pixmap
+        self._worker = None
 
         self._build_ui()
 
@@ -185,7 +192,6 @@ class PhotoTraceWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         # --- References row ---
-        ref_box = QVBoxLayout()
         ref_header = QHBoxLayout()
         ref_header.addWidget(QLabel("<b>1. Reference photos</b> (1–3 of the same person)"))
         ref_header.addStretch()
@@ -195,15 +201,14 @@ class PhotoTraceWindow(QMainWindow):
         self.clear_ref_btn.clicked.connect(self.clear_references)
         ref_header.addWidget(self.add_ref_btn)
         ref_header.addWidget(self.clear_ref_btn)
-        ref_box.addLayout(ref_header)
+        root.addLayout(ref_header)
 
         self.ref_list = QListWidget()
         self.ref_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.ref_list.setIconSize(QSize(REF_THUMB_SIZE, REF_THUMB_SIZE))
         self.ref_list.setFixedHeight(REF_THUMB_SIZE + 40)
         self.ref_list.setMovement(QListWidget.Movement.Static)
-        ref_box.addWidget(self.ref_list)
-        root.addLayout(ref_box)
+        root.addWidget(self.ref_list)
 
         # --- Target folder row ---
         folder_row = QHBoxLayout()
@@ -220,21 +225,25 @@ class PhotoTraceWindow(QMainWindow):
         action_row = QHBoxLayout()
         self.index_btn = QPushButton("Index folder")
         self.index_btn.clicked.connect(self.start_index)
-        action_row.addWidget(self.index_btn)
-
-        action_row.addWidget(QLabel("Threshold:"))
-        self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.10, 1.00)
-        self.threshold_spin.setSingleStep(0.05)
-        self.threshold_spin.setValue(0.60)
-        self.threshold_spin.setToolTip("Lower = stricter. Live slider comes in Stage 4.")
-        action_row.addWidget(self.threshold_spin)
-
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.start_search)
+        action_row.addWidget(self.index_btn)
         action_row.addWidget(self.search_btn)
         action_row.addStretch()
         root.addLayout(action_row)
+
+        # --- Live confidence slider ---
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Confidence threshold:"))
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(SLIDER_MIN, SLIDER_MAX)
+        self.slider.setValue(SLIDER_DEFAULT)
+        self.slider.setToolTip("Drag to re-filter results live. Lower = stricter.")
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        filter_row.addWidget(self.slider, stretch=1)
+        self.slider_label = QLabel(f"{self._threshold():.2f}")
+        filter_row.addWidget(self.slider_label)
+        root.addLayout(filter_row)
 
         # --- Progress + status ---
         self.progress = QProgressBar()
@@ -243,6 +252,23 @@ class PhotoTraceWindow(QMainWindow):
         self.status = QLabel(f"Ready. Cache: {self.cache_path}")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
+
+        # --- Selection / file-ops toolbar ---
+        ops_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select all")
+        self.select_all_btn.clicked.connect(lambda: self._set_all_selected(True))
+        self.deselect_all_btn = QPushButton("Deselect all")
+        self.deselect_all_btn.clicked.connect(lambda: self._set_all_selected(False))
+        ops_row.addWidget(self.select_all_btn)
+        ops_row.addWidget(self.deselect_all_btn)
+        ops_row.addStretch()
+        self.copy_btn = QPushButton("Copy selected…")
+        self.copy_btn.clicked.connect(self.copy_selected)
+        self.move_btn = QPushButton("Move selected…")
+        self.move_btn.clicked.connect(self.move_selected)
+        ops_row.addWidget(self.copy_btn)
+        ops_row.addWidget(self.move_btn)
+        root.addLayout(ops_row)
 
         # --- Results grid (scrollable) ---
         self.results_host = QWidget()
@@ -254,6 +280,17 @@ class PhotoTraceWindow(QMainWindow):
         root.addWidget(scroll, stretch=1)
 
         self.setCentralWidget(central)
+
+    # -- Small helpers ------------------------------------------------------
+
+    def _threshold(self) -> float:
+        return self.slider.value() / 100.0
+
+    def _thumb(self, path_str: str) -> QPixmap | None:
+        """Cached grid thumbnail so live re-filtering never re-reads from disk."""
+        if path_str not in self._thumb_cache:
+            self._thumb_cache[path_str] = load_thumbnail(Path(path_str), THUMB_SIZE)
+        return self._thumb_cache[path_str]
 
     # -- Reference handling -------------------------------------------------
 
@@ -333,37 +370,50 @@ class PhotoTraceWindow(QMainWindow):
             return
         self._set_busy(True)
         self.status.setText("Searching…")
-        self._clear_results()
+        self.selected_paths.clear()
+        self._clear_grid()
 
-        self._worker = SearchWorker(
-            list(self.reference_paths), self.cache_path, self.threshold_spin.value())
+        self._worker = SearchWorker(list(self.reference_paths), self.cache_path)
         self._worker.done.connect(self._on_search_done)
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
-    def _on_search_done(self, matches: list, elapsed: float):
+    def _on_search_done(self, candidates: list, elapsed: float):
         self._set_busy(False)
-        threshold = self.threshold_spin.value()
+        self.all_candidates = candidates
+        self._last_search_ms = elapsed * 1000
+        self._apply_filter()
+
+    # -- Live filter + results grid -----------------------------------------
+
+    def _on_slider_changed(self):
+        self.slider_label.setText(f"{self._threshold():.2f}")
+        if self.all_candidates:
+            self._apply_filter()
+
+    def _apply_filter(self):
+        """Show only candidates within the current threshold. Cheap: reuses
+        cached thumbnails and just rebuilds the grid widgets."""
+        threshold = self._threshold()
+        shown = [(p, d) for (p, d) in self.all_candidates if d <= threshold]
+
+        self._clear_grid()
+        for idx, (path_str, distance) in enumerate(shown):
+            card = self._make_result_card(path_str, distance, threshold)
+            self.results_grid.addWidget(card, idx // GRID_COLUMNS, idx % GRID_COLUMNS)
+
+        ms = getattr(self, "_last_search_ms", 0.0)
         self.status.setText(
-            f"{len(matches)} match(es) in {elapsed*1000:.0f} ms "
-            f"(threshold {threshold:.2f}).")
-        self._populate_results(matches, threshold)
+            f"Showing {len(shown)} of {len(self.all_candidates)} candidate(s) "
+            f"at threshold {threshold:.2f} · last search {ms:.0f} ms.")
 
-    # -- Results grid -------------------------------------------------------
-
-    def _clear_results(self):
-        self.result_checkboxes.clear()
+    def _clear_grid(self):
+        self.visible_checks.clear()
         while self.results_grid.count():
             item = self.results_grid.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-
-    def _populate_results(self, matches: list, threshold: float):
-        self._clear_results()
-        for idx, (path_str, distance) in enumerate(matches):
-            card = self._make_result_card(path_str, distance, threshold)
-            self.results_grid.addWidget(card, idx // GRID_COLUMNS, idx % GRID_COLUMNS)
 
     def _make_result_card(self, path_str: str, distance: float, threshold: float) -> QWidget:
         card = QFrame()
@@ -373,7 +423,7 @@ class PhotoTraceWindow(QMainWindow):
         thumb = QLabel()
         thumb.setFixedSize(THUMB_SIZE, THUMB_SIZE)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pix = load_thumbnail(Path(path_str), THUMB_SIZE)
+        pix = self._thumb(path_str)
         thumb.setPixmap(pix) if pix else thumb.setText("(no preview)")
         v.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -384,10 +434,77 @@ class PhotoTraceWindow(QMainWindow):
 
         check = QCheckBox(Path(path_str).name)
         check.setToolTip(path_str)
+        check.setChecked(path_str in self.selected_paths)   # restore selection
+        check.toggled.connect(lambda on, p=path_str: self._on_check(p, on))
         v.addWidget(check)
-        self.result_checkboxes.append((path_str, check))
+        self.visible_checks.append((path_str, check))
 
         return card
+
+    def _on_check(self, path_str: str, on: bool):
+        if on:
+            self.selected_paths.add(path_str)
+        else:
+            self.selected_paths.discard(path_str)
+
+    def _set_all_selected(self, on: bool):
+        for path_str, check in self.visible_checks:
+            check.setChecked(on)   # toggled signal keeps selected_paths in sync
+
+    # -- File operations ----------------------------------------------------
+
+    def _selected_existing(self) -> list[str]:
+        """Selected paths that still exist on disk (and are currently shown)."""
+        shown = {p for p, _ in self.visible_checks}
+        return [p for p in shown if p in self.selected_paths and Path(p).exists()]
+
+    def copy_selected(self):
+        self._do_transfer(move=False)
+
+    def move_selected(self):
+        self._do_transfer(move=True)
+
+    def _do_transfer(self, *, move: bool):
+        selected = self._selected_existing()
+        if not selected:
+            QMessageBox.information(self, "PhotoTrace", "No images selected.")
+            return
+
+        verb = "Move" if move else "Copy"
+        dest = QFileDialog.getExistingDirectory(self, f"{verb} {len(selected)} image(s) to…")
+        if not dest:
+            return
+        dest_dir = Path(dest)
+
+        # Confirmation is required before a MOVE (it relocates the originals).
+        if move:
+            reply = QMessageBox.question(
+                self, "Confirm move",
+                f"Move {len(selected)} image(s) to:\n{dest_dir}\n\n"
+                f"The original files will be relocated. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if move:
+            succeeded, failed = fileops.move_files(selected, dest_dir)
+        else:
+            succeeded, failed = fileops.copy_files(selected, dest_dir)
+
+        # After a move, the originals are gone — drop them from the result set
+        # and the current selection so the grid reflects reality.
+        if move:
+            moved = {str(src) for src, _ in succeeded}
+            self.all_candidates = [(p, d) for (p, d) in self.all_candidates if p not in moved]
+            self.selected_paths -= moved
+            self._apply_filter()
+
+        msg = f"{verb}d {len(succeeded)} image(s) to:\n{dest_dir}"
+        if failed:
+            msg += f"\n\n{len(failed)} failed:\n" + "\n".join(
+                f"  • {Path(p).name}: {e}" for p, e in failed[:10])
+        QMessageBox.information(self, "PhotoTrace", msg)
 
     # -- Shared helpers -----------------------------------------------------
 
@@ -399,7 +516,8 @@ class PhotoTraceWindow(QMainWindow):
 
     def _set_busy(self, busy: bool):
         for w in (self.index_btn, self.search_btn, self.add_ref_btn,
-                  self.clear_ref_btn, self.pick_folder_btn):
+                  self.clear_ref_btn, self.pick_folder_btn,
+                  self.copy_btn, self.move_btn):
             w.setEnabled(not busy)
 
 
