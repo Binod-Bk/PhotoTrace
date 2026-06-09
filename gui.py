@@ -27,15 +27,18 @@ from __future__ import annotations
 
 import sys
 import time
+import webbrowser
 from pathlib import Path
+from string import Template
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QVBoxLayout,
+    QWidget,
 )
 from PIL import Image
 
@@ -52,6 +55,112 @@ MAX_REFERENCES = 3
 # slider then filters within that set. Keeping a cap bounds how much we hold.
 SEARCH_CAP = 0.80
 SLIDER_MIN, SLIDER_MAX, SLIDER_DEFAULT = 30, 80, 60   # represent 0.30..0.80
+
+# Two themes (dark / light) sharing one indigo/violet accent. The stylesheet is
+# built once per palette from a template, then applied to the whole app via
+# QApplication.setStyleSheet — toggling at runtime simply swaps which one is set.
+# Primary actions use a dynamic `primary="true"` property; footer links use
+# `link="true"`; result cards use objectName "card" (+ a "selected" property).
+REPO_URL = "https://github.com/Binod-Bk/PhotoTrace"
+ACCENT = "#6366F1"
+
+_QSS = Template("""
+* { font-family: "Segoe UI", "Inter", sans-serif; font-size: 13px; color: ${text}; }
+QMainWindow, QWidget { background-color: ${bg}; }
+
+QLabel { color: ${text}; background: transparent; }
+QLabel#appTitle { font-size: 24px; font-weight: 800; color: ${text}; }
+QLabel#sectionHeader { font-size: 14px; font-weight: 700; color: ${text}; }
+QLabel#muted { color: ${muted}; }
+
+QPushButton {
+    background-color: ${btn}; color: ${text};
+    border: 1px solid ${border}; border-radius: 8px; padding: 7px 14px;
+}
+QPushButton:hover { background-color: ${btn_hover}; }
+QPushButton:pressed { background-color: ${btn_pressed}; }
+QPushButton:disabled { color: ${muted}; }
+
+QPushButton[primary="true"] {
+    background-color: ${accent}; border: 1px solid ${accent};
+    color: #FFFFFF; font-weight: 600; padding: 8px 20px;
+}
+QPushButton[primary="true"]:hover { background-color: ${accent_hover}; border-color: ${accent_hover}; }
+QPushButton[primary="true"]:pressed { background-color: ${accent_pressed}; }
+
+QPushButton[link="true"] {
+    background: transparent; border: none; color: ${accent};
+    padding: 4px 6px; font-weight: 600;
+}
+QPushButton[link="true"]:hover { color: ${accent_hover}; }
+
+QFrame#card { background-color: ${card}; border: 1px solid ${border}; border-radius: 12px; }
+QFrame#card[selected="true"] { border: 2px solid ${accent}; background-color: ${card_sel}; }
+QFrame#footer { border-top: 1px solid ${border}; }
+
+QListWidget { background-color: ${card}; border: 1px solid ${border}; border-radius: 10px; padding: 6px; }
+QListWidget::item { color: ${text}; }
+QListWidget::item:selected { background: transparent; }
+
+QSlider::groove:horizontal { height: 6px; background: ${border}; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: ${accent}; border-radius: 3px; }
+QSlider::handle:horizontal {
+    background: ${handle}; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px;
+}
+
+QProgressBar {
+    background: ${card}; border: 1px solid ${border}; border-radius: 8px;
+    text-align: center; color: ${text}; height: 18px;
+}
+QProgressBar::chunk { background-color: ${accent}; border-radius: 7px; }
+
+QCheckBox { color: ${text}; spacing: 6px; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; border-radius: 4px;
+    border: 1px solid ${border}; background: ${indicator};
+}
+QCheckBox::indicator:checked { background: ${accent}; border-color: ${accent}; }
+
+QScrollArea { border: none; background: transparent; }
+QScrollBar:vertical { background: transparent; width: 12px; margin: 0; }
+QScrollBar::handle:vertical { background: ${scroll}; border-radius: 6px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: ${scroll_hover}; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QDialog { background-color: ${bg}; }
+QToolTip { background: ${tooltip}; color: ${text}; border: 1px solid ${border}; padding: 4px; }
+""")
+
+_DARK = dict(
+    bg="#1A1A20", card="#24242C", card_sel="#2A2A38", border="#32323D",
+    text="#E5E7EB", muted="#8A8D99", accent=ACCENT, accent_hover="#7C7FF2",
+    accent_pressed="#4F46E5", btn="#2B2B35", btn_hover="#34343F",
+    btn_pressed="#26262E", indicator="#2B2B35", handle="#FFFFFF",
+    scroll="#3A3A46", scroll_hover="#4B4B58", tooltip="#2B2B35",
+)
+_LIGHT = dict(
+    bg="#F4F5F7", card="#FFFFFF", card_sel="#EEF0FE", border="#E2E4E9",
+    text="#1F2430", muted="#6B7280", accent=ACCENT, accent_hover="#7C7FF2",
+    accent_pressed="#4F46E5", btn="#FFFFFF", btn_hover="#F0F1F4",
+    btn_pressed="#E6E8EC", indicator="#FFFFFF", handle=ACCENT,
+    scroll="#C9CCD4", scroll_hover="#B3B7C2", tooltip="#FFFFFF",
+)
+THEME_DARK = _QSS.substitute(_DARK)
+THEME_LIGHT = _QSS.substitute(_LIGHT)
+THEME = THEME_DARK   # default; also used by headless tests
+
+
+def _confidence_pill_style(conf: float) -> str:
+    """Inline style for the confidence badge — green / amber / slate by tier."""
+    if conf >= 80:
+        rgb = "52, 211, 153"       # green
+    elif conf >= 65:
+        rgb = "251, 191, 36"       # amber
+    else:
+        rgb = "148, 163, 184"      # slate
+    return (f"background: rgba({rgb}, 0.16); color: rgb({rgb}); "
+            f"font-weight: 700; border-radius: 9px; padding: 2px 10px;")
 
 
 # ---------------------------------------------------------------------------
@@ -215,20 +324,57 @@ class PhotoTraceWindow(QMainWindow):
         self.selected_paths: set[str] = set()               # survives re-filtering
         self._thumb_cache: dict[str, QPixmap] = {}          # path -> grid pixmap
         self._worker = None
+        self._dark = True                                   # current theme
 
         self._build_ui()
 
     # -- UI construction ----------------------------------------------------
 
+    def _section_header(self, text: str, hint: str = "") -> QHBoxLayout:
+        row = QHBoxLayout()
+        title = QLabel(text)
+        title.setObjectName("sectionHeader")
+        row.addWidget(title)
+        if hint:
+            h = QLabel(hint)
+            h.setObjectName("muted")
+            row.addWidget(h)
+        row.addStretch()
+        return row
+
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
+        root.setContentsMargins(22, 16, 22, 12)
+        root.setSpacing(12)
 
-        # --- References row ---
-        ref_header = QHBoxLayout()
-        ref_header.addWidget(QLabel("<b>1. Reference photos</b> (1–3 of the same person)"))
-        ref_header.addStretch()
-        self.add_ref_btn = QPushButton("Add reference…")
+        # --- Top bar: theme toggle (left, width-matched) + centered title ---
+        topbar = QHBoxLayout()
+        self.theme_btn = QPushButton("☀  Light")
+        self.theme_btn.setFixedWidth(110)
+        self.theme_btn.setToolTip("Switch between dark and light themes")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        topbar.addWidget(self.theme_btn)
+        topbar.addStretch(1)
+        title = QLabel("PhotoTrace")
+        title.setObjectName("appTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        topbar.addWidget(title)
+        topbar.addStretch(1)
+        right_spacer = QWidget()           # balances the toggle so the title centers
+        right_spacer.setFixedWidth(110)
+        topbar.addWidget(right_spacer)
+        root.addLayout(topbar)
+
+        subtitle = QLabel("Find every photo of a person — locally, offline.")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(subtitle)
+
+        # --- 1. References ---
+        ref_header = self._section_header("1  ·  Reference photos",
+                                          "1–3 clear photos of the same person")
+        self.add_ref_btn = QPushButton("＋  Add reference…")
         self.add_ref_btn.clicked.connect(self.add_references)
         self.clear_ref_btn = QPushButton("Clear")
         self.clear_ref_btn.clicked.connect(self.clear_references)
@@ -239,14 +385,17 @@ class PhotoTraceWindow(QMainWindow):
         self.ref_list = QListWidget()
         self.ref_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.ref_list.setIconSize(QSize(REF_THUMB_SIZE, REF_THUMB_SIZE))
-        self.ref_list.setFixedHeight(REF_THUMB_SIZE + 40)
+        self.ref_list.setFixedHeight(REF_THUMB_SIZE + 44)
+        self.ref_list.setSpacing(8)
         self.ref_list.setMovement(QListWidget.Movement.Static)
         root.addWidget(self.ref_list)
 
-        # --- Target folder row ---
+        # --- 2. Folder ---
+        folder_header = self._section_header("2  ·  Folder to search")
+        root.addLayout(folder_header)
         folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("<b>2. Folder</b>"))
-        self.folder_label = QLabel("<i>no folder selected</i>")
+        self.folder_label = QLabel("No folder selected")
+        self.folder_label.setObjectName("muted")
         self.folder_label.setMinimumWidth(360)
         folder_row.addWidget(self.folder_label, stretch=1)
         self.pick_folder_btn = QPushButton("Choose folder…")
@@ -254,11 +403,15 @@ class PhotoTraceWindow(QMainWindow):
         folder_row.addWidget(self.pick_folder_btn)
         root.addLayout(folder_row)
 
-        # --- Actions row ---
+        # --- 3. Actions (primary) ---
         action_row = QHBoxLayout()
+        action_row.setSpacing(10)
         self.index_btn = QPushButton("Index folder")
+        self.index_btn.setProperty("primary", True)
+        self.index_btn.setToolTip("Analyze the folder once (slow). Required before searching.")
         self.index_btn.clicked.connect(self.start_index)
-        self.search_btn = QPushButton("Search")
+        self.search_btn = QPushButton("🔍  Search")
+        self.search_btn.setProperty("primary", True)
         self.search_btn.clicked.connect(self.start_search)
         action_row.addWidget(self.index_btn)
         action_row.addWidget(self.search_btn)
@@ -267,7 +420,9 @@ class PhotoTraceWindow(QMainWindow):
 
         # --- Live confidence slider ---
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Confidence threshold:"))
+        slabel = QLabel("Confidence threshold")
+        slabel.setObjectName("muted")
+        filter_row.addWidget(slabel)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(SLIDER_MIN, SLIDER_MAX)
         self.slider.setValue(SLIDER_DEFAULT)
@@ -275,6 +430,7 @@ class PhotoTraceWindow(QMainWindow):
         self.slider.valueChanged.connect(self._on_slider_changed)
         filter_row.addWidget(self.slider, stretch=1)
         self.slider_label = QLabel(f"{self._threshold():.2f}")
+        self.slider_label.setMinimumWidth(34)
         filter_row.addWidget(self.slider_label)
         root.addLayout(filter_row)
 
@@ -282,12 +438,14 @@ class PhotoTraceWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         root.addWidget(self.progress)
-        self.status = QLabel(f"Ready. Cache: {self.cache_path}")
+        self.status = QLabel("Ready — add reference photos and choose a folder to begin.")
+        self.status.setObjectName("muted")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
         # --- Selection / file-ops toolbar ---
         ops_row = QHBoxLayout()
+        ops_row.setSpacing(8)
         self.select_all_btn = QPushButton("Select all")
         self.select_all_btn.clicked.connect(lambda: self._set_all_selected(True))
         self.deselect_all_btn = QPushButton("Deselect all")
@@ -307,12 +465,84 @@ class PhotoTraceWindow(QMainWindow):
         self.results_host = QWidget()
         self.results_grid = QGridLayout(self.results_host)
         self.results_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.results_grid.setSpacing(14)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.results_host)
         root.addWidget(scroll, stretch=1)
 
+        # --- Footer: guide + source-code links ---
+        footer = QFrame()
+        footer.setObjectName("footer")
+        footer_row = QHBoxLayout(footer)
+        footer_row.setContentsMargins(2, 8, 2, 2)
+        guide_btn = QPushButton("Need a Guide?")
+        guide_btn.setProperty("link", True)
+        guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        guide_btn.clicked.connect(self.show_guide)
+        footer_row.addWidget(guide_btn)
+        footer_row.addStretch()
+        src_btn = QPushButton("Source code  ↗")
+        src_btn.setProperty("link", True)
+        src_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        src_btn.setToolTip(REPO_URL)
+        src_btn.clicked.connect(lambda: webbrowser.open(REPO_URL))
+        footer_row.addWidget(src_btn)
+        root.addWidget(footer)
+
         self.setCentralWidget(central)
+        self.setMinimumSize(820, 640)
+
+    # -- Theme + footer actions --------------------------------------------
+
+    def _toggle_theme(self):
+        self._dark = not self._dark
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(THEME_DARK if self._dark else THEME_LIGHT)
+        # Show the mode you'd switch TO next.
+        self.theme_btn.setText("☀  Light" if self._dark else "🌙  Dark")
+
+    def show_guide(self):
+        """Pop a friendly step-by-step walkthrough."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("How to use PhotoTrace")
+        dlg.setMinimumWidth(460)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(12)
+
+        heading = QLabel("How to use PhotoTrace")
+        heading.setObjectName("appTitle")
+        lay.addWidget(heading)
+
+        steps = QLabel(
+            "<ol style='margin-left:-18px; line-height:150%;'>"
+            "<li><b>Add reference photos</b> — pick 1–3 clear, front-facing "
+            "photos of the person you're looking for.</li>"
+            "<li><b>Choose a folder</b> — the folder of photos to search "
+            "(subfolders are included).</li>"
+            "<li><b>Index folder</b> — analyzes every photo once. The first run "
+            "is slow; after that it's cached and instant.</li>"
+            "<li><b>Search</b> — matches appear as thumbnails with a confidence "
+            "score and a green box on the matched face (great for group photos).</li>"
+            "<li><b>Confidence slider</b> — drag to loosen or tighten matches "
+            "live; no need to search again.</li>"
+            "<li><b>Select &amp; act</b> — tick the photos you want, then "
+            "<b>Copy</b> or <b>Move</b> them to a folder. <b>Open</b> views a "
+            "photo. There is no delete — moving is the safe alternative.</li>"
+            "</ol>"
+        )
+        steps.setWordWrap(True)
+        steps.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(steps)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Got it")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("primary", True)
+        buttons.accepted.connect(dlg.accept)
+        lay.addWidget(buttons)
+        dlg.exec()
 
     # -- Small helpers ------------------------------------------------------
 
@@ -453,8 +683,11 @@ class PhotoTraceWindow(QMainWindow):
     def _make_result_card(self, path_str: str, distance: float,
                           location: tuple, threshold: float) -> QWidget:
         card = QFrame()
-        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setObjectName("card")
+        card.setProperty("selected", path_str in self.selected_paths)
         v = QVBoxLayout(card)
+        v.setContentsMargins(12, 12, 12, 10)
+        v.setSpacing(8)
 
         thumb = QLabel()
         thumb.setFixedSize(THUMB_SIZE, THUMB_SIZE)
@@ -463,16 +696,24 @@ class PhotoTraceWindow(QMainWindow):
         thumb.setPixmap(pix) if pix else thumb.setText("(no preview)")
         v.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Confidence badge (coloured by tier) + muted distance, on one row.
         conf = engine.distance_to_confidence(distance, threshold) * 100
-        info = QLabel(f"{conf:.0f}% &nbsp;·&nbsp; dist {distance:.3f}")
-        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        v.addWidget(info)
+        meta = QHBoxLayout()
+        badge = QLabel(f"{conf:.0f}% match")
+        badge.setStyleSheet(_confidence_pill_style(conf))
+        meta.addWidget(badge)
+        meta.addStretch()
+        dist_lbl = QLabel(f"dist {distance:.3f}")
+        dist_lbl.setObjectName("muted")
+        meta.addWidget(dist_lbl)
+        v.addLayout(meta)
 
+        # Filename (elided/muted) + selection checkbox + Open.
         bottom = QHBoxLayout()
-        check = QCheckBox(Path(path_str).name)
+        check = QCheckBox(self._elide(Path(path_str).name, 20))
         check.setToolTip(path_str)
         check.setChecked(path_str in self.selected_paths)   # restore selection
-        check.toggled.connect(lambda on, p=path_str: self._on_check(p, on))
+        check.toggled.connect(lambda on, p=path_str, c=card: self._on_check(p, on, c))
         bottom.addWidget(check, stretch=1)
         open_btn = QPushButton("Open")
         open_btn.setToolTip("Open in the system's default editor")
@@ -483,11 +724,19 @@ class PhotoTraceWindow(QMainWindow):
         self.visible_checks.append((path_str, check))
         return card
 
-    def _on_check(self, path_str: str, on: bool):
+    @staticmethod
+    def _elide(text: str, limit: int) -> str:
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    def _on_check(self, path_str: str, on: bool, card: QWidget | None = None):
         if on:
             self.selected_paths.add(path_str)
         else:
             self.selected_paths.discard(path_str)
+        if card is not None:   # repaint the accent selection border
+            card.setProperty("selected", on)
+            card.style().unpolish(card)
+            card.style().polish(card)
 
     def _set_all_selected(self, on: bool):
         for path_str, check in self.visible_checks:
@@ -565,6 +814,7 @@ class PhotoTraceWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyleSheet(THEME)
     window = PhotoTraceWindow()
     window.show()
     sys.exit(app.exec())
