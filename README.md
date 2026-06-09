@@ -3,7 +3,8 @@
 Find every photo containing a specific person across a folder — including group
 photos — using local, offline face recognition. No network, no cloud.
 
-> **Status: Stage 1** — command-line proof of the matching. No UI, no cache yet.
+> **Status: Stage 2** — persistent embedding cache + multi-reference search
+> (command-line). Index a folder once, then search it instantly. No UI yet.
 
 ## Install (Windows + Python 3.13)
 
@@ -45,22 +46,40 @@ The same commands work. On most Linux/macOS + Python combos the plain
 python -c "import face_recognition; print('engine ready')"
 ```
 
-## Usage (Stage 1)
+## Usage (Stage 2 — current)
+
+Two phases: **index** a folder once (slow), then **search** it as often as you
+like (instant). Searching for a different person reuses the same index.
 
 ```powershell
-python stage1_match.py REFERENCE_IMAGE TARGET_FOLDER [--threshold 0.6]
+# 1) Index a folder (recursive). Repeat later only to pick up new/changed files.
+python phototrace.py index "C:\Users\binod\Pictures"
+
+# 2) Search with 1-3 reference photos of ONE person (they get averaged together).
+python phototrace.py search ref1.jpg ref2.jpg ref3.jpg
+python phototrace.py search ref1.jpg --threshold 0.55 --dir "C:\Users\binod\Pictures"
 ```
 
-- `REFERENCE_IMAGE` — one clear, front-facing photo of the target person.
-- `TARGET_FOLDER` — scanned recursively for `.jpg .jpeg .png .webp .avif`
-  (AVIF needs Pillow >= 11.3, which bundles libavif; older Pillow skips them).
+- Supported formats: `.jpg .jpeg .png .webp .avif` (AVIF needs Pillow >= 11.3,
+  which bundles libavif; older Pillow skips them), scanned recursively.
 - `--threshold` — face *distance* cutoff (lower = stricter). Default `0.6`.
+- `--dir` — limit a search to one folder within the index.
+- `--cache PATH` — use a specific cache file (default: `~/.phototrace/index.pkl`).
+- `index --rebuild` — ignore the existing cache and re-index everything.
 
-Example:
+**Why two phases:** face detection + embedding is the slow part. The index does
+it once and caches `(file_path, face_location, embedding)` to disk. Re-indexing
+skips unchanged files (tracked by mod/size), and every search just compares
+cached vectors — typically a few **milliseconds**.
 
-```powershell
-python stage1_match.py me.jpg "C:\Users\binod\Pictures" --threshold 0.55
-```
+### Module layout
+
+| File              | Responsibility                                              |
+|-------------------|-------------------------------------------------------------|
+| `engine.py`       | All face-recognition calls (swap here for InsightFace later)|
+| `cache.py`        | Persistent embedding cache (pickle now; SQLite in Stage 5)  |
+| `phototrace.py`   | CLI: `index` and `search` commands                          |
+| `stage1_match.py` | Stage 1 single-file proof (kept for reference)              |
 
 ### Tuning the threshold
 
