@@ -14,6 +14,7 @@ search logic, and the future UI never import the recognition library directly.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -82,3 +83,24 @@ def face_distance(known_encodings: list[np.ndarray], target: np.ndarray) -> np.n
     recognition library directly.
     """
     return face_recognition.face_distance(known_encodings, target)
+
+
+def distance_to_confidence(distance: float, threshold: float = 0.6) -> float:
+    """
+    Turn a raw face *distance* (lower = better) into a friendly 0..1 confidence
+    (higher = better) for display in the UI.
+
+    Calibrated against the threshold so it reads intuitively:
+      * distance 0          -> ~1.0  (≈100%)
+      * distance == threshold -> 0.5  (50% — right at the match boundary)
+      * distance well beyond  -> 0.0
+    This is for human readability only; matching still uses the raw distance.
+    """
+    if distance > threshold:
+        span = (1.0 - threshold)
+        linear = (1.0 - distance) / (span * 2.0)
+        return max(0.0, linear)
+    # Inside the match region: ease the curve up toward 1.0.
+    span = threshold
+    linear = 1.0 - (distance / (span * 2.0))
+    return linear + (1.0 - linear) * math.pow((linear - 0.5) * 2.0, 0.2)
