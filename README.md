@@ -47,7 +47,27 @@ The same commands work. On most Linux/macOS + Python combos the plain
 python -c "import face_recognition; print('engine ready')"
 ```
 
+## Build a standalone .exe (Windows)
+
+To produce a single `PhotoTrace.exe` that runs without Python installed:
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller PhotoTrace.spec
+```
+
+The exe lands in `dist\PhotoTrace.exe` (~150 MB — it bundles Python, Qt, dlib,
+and the face models). It's a windowed app: double-click to run. The build
+recipe `PhotoTrace.spec` handles the two things PyInstaller can't auto-detect —
+the dlib model data files and Pillow's AVIF/WebP plugins.
+
+> The `.exe` is too large for the git repo (GitHub caps files at 100 MB);
+> distribute it via a GitHub **Release** instead. `build/` and `dist/` are
+> git-ignored.
+
 ## Usage — desktop app
+
+Either double-click `dist\PhotoTrace.exe`, or run from source:
 
 ```powershell
 python gui.py

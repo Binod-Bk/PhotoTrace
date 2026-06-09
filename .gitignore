@@ -10,6 +10,12 @@ env/
 *.npy
 *.db
 
+# PyInstaller build output (the .exe is ~154 MB — share via a GitHub Release,
+# not the repo). The build recipe PhotoTrace.spec IS committed.
+build/
+dist/
+*.manifest
+
 # OS
 Thumbs.db
 .DS_Store
