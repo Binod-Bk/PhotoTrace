@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 import engine
-import cache as cache_mod
+from db import FaceCache, default_db_path
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ def iter_images(folder: Path):
 
 
 def resolve_cache_path(args) -> Path:
-    return Path(args.cache).expanduser() if args.cache else cache_mod.default_cache_path()
+    return Path(args.cache).expanduser() if args.cache else default_db_path()
 
 
 def is_under(path: Path, folder: Path) -> bool:
@@ -75,7 +75,9 @@ def cmd_index(args) -> int:
         return 1
 
     cache_path = resolve_cache_path(args)
-    cache = cache_mod.empty_cache() if args.rebuild else cache_mod.load_cache(cache_path)
+    cache = FaceCache(cache_path)
+    if args.rebuild:
+        cache.clear()
 
     print("=" * 70)
     print("PhotoTrace — INDEX")
@@ -95,7 +97,7 @@ def cmd_index(args) -> int:
 
     for image_path in iter_images(folder):
         # Skip files we've already indexed and that haven't changed.
-        if cache_mod.is_cached_current(cache, image_path):
+        if cache.is_current(image_path):
             skipped_cached += 1
             continue
 
@@ -107,15 +109,17 @@ def cmd_index(args) -> int:
             print(f"  [skip] {image_path}  ({exc})")
             continue
 
-        cache_mod.store_file(cache, image_path, faces)
+        cache.upsert_file(image_path, faces)
         indexed += 1
         total_faces += len(faces)
         print(f"  [index] {len(faces)} face(s)  {image_path}")
 
     # Forget files that were deleted from disk since last index.
-    pruned = cache_mod.prune_missing(cache, under=folder)
+    pruned = cache.prune_missing(under=folder)
 
-    cache_mod.save_cache(cache, cache_path)
+    cache.commit()
+    total_cached = cache.file_count()
+    cache.close()
     elapsed = time.perf_counter() - start
 
     print()
@@ -126,7 +130,7 @@ def cmd_index(args) -> int:
     print(f"Skipped (cached)   : {skipped_cached}")
     print(f"Errors (unreadable): {errors}")
     print(f"Pruned (deleted)   : {pruned}")
-    print(f"Total files cached : {len(cache['files'])}")
+    print(f"Total files cached : {total_cached}")
     print(f"Time taken         : {elapsed:.2f} s")
     print("=" * 70)
     return 0
@@ -138,8 +142,8 @@ def cmd_index(args) -> int:
 
 def cmd_search(args) -> int:
     cache_path = resolve_cache_path(args)
-    cache = cache_mod.load_cache(cache_path)
-    if not cache["files"]:
+    cache = FaceCache(cache_path)
+    if cache.file_count() == 0:
         print(f"Error: cache is empty. Run 'index' first.\n  cache: {cache_path}")
         return 1
 
@@ -188,22 +192,23 @@ def cmd_search(args) -> int:
     searched = 0
     matches = []  # (path, best_distance)
 
-    for path_str, record in cache["files"].items():
+    for path_str, faces in cache.iter_files():
         path = Path(path_str)
         if scope_dir and not is_under(path, scope_dir):
             continue
         if not path.exists():
             continue  # file was moved/deleted since indexing
-        if not record["faces"]:
+        if not faces:
             continue
         searched += 1
 
-        encodings = [f["embedding"] for f in record["faces"]]
+        encodings = [emb for _loc, emb in faces]
         distances = engine.face_distance(encodings, target)
         best = float(min(distances))
         if best <= threshold:
             matches.append((path_str, best))
 
+    cache.close()
     elapsed = time.perf_counter() - start
 
     print("=" * 70)

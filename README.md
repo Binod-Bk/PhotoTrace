@@ -3,9 +3,9 @@
 Find every photo containing a specific person across a folder — including group
 photos — using local, offline face recognition. No network, no cloud.
 
-> **Status: Stage 4** — desktop app with file operations: select images,
-> MOVE/COPY them to a folder, and a live confidence slider that re-filters
-> results instantly. Move asks for confirmation; there is no delete.
+> **Status: Stage 5 (complete)** — full local desktop app. SQLite-backed cache,
+> matched-face highlighting, open-in-default-editor, plus everything from the
+> earlier stages: multi-reference search, move/copy, live confidence slider.
 
 ## Install (Windows + Python 3.13)
 
@@ -47,7 +47,7 @@ The same commands work. On most Linux/macOS + Python combos the plain
 python -c "import face_recognition; print('engine ready')"
 ```
 
-## Usage (Stage 3 — desktop app)
+## Usage — desktop app
 
 ```powershell
 python gui.py
@@ -56,8 +56,10 @@ python gui.py
 1. **Add reference…** — pick 1–3 photos of the same person (they're averaged).
 2. **Choose folder…** — the folder to search.
 3. **Index folder** — one-time, runs in the background with a live progress bar.
-4. **Search** — shows matches in a scrollable thumbnail grid, each with a
-   confidence score and a checkbox.
+4. **Search** — shows matches in a scrollable thumbnail grid. Each result has a
+   confidence score, a checkbox, an **Open** button (opens the image in the
+   system's default editor), and a **green box drawn around the matched face**
+   so you can verify before acting — important for group photos.
 5. **Confidence slider** — drag to re-filter the shown results instantly (no
    re-search; a search collects every candidate up to a cap and the slider just
    changes which are displayed).
@@ -69,7 +71,10 @@ python gui.py
 Indexing and searching run on background threads, so the window stays
 responsive. Thumbnails load through Pillow, so `.webp` / `.avif` previews work.
 
-## Usage (command-line, Stage 2)
+## Usage — command line
+
+The GUI and CLI share the same SQLite cache, so you can index from one and
+search from the other.
 
 Two phases: **index** a folder once (slow), then **search** it as often as you
 like (instant). Searching for a different person reuses the same index.
@@ -87,7 +92,7 @@ python phototrace.py search ref1.jpg --threshold 0.55 --dir "C:\Users\binod\Pict
   which bundles libavif; older Pillow skips them), scanned recursively.
 - `--threshold` — face *distance* cutoff (lower = stricter). Default `0.6`.
 - `--dir` — limit a search to one folder within the index.
-- `--cache PATH` — use a specific cache file (default: `~/.phototrace/index.pkl`).
+- `--cache PATH` — use a specific cache file (default: `~/.phototrace/index.db`).
 - `index --rebuild` — ignore the existing cache and re-index everything.
 
 **Why two phases:** face detection + embedding is the slow part. The index does
@@ -95,16 +100,30 @@ it once and caches `(file_path, face_location, embedding)` to disk. Re-indexing
 skips unchanged files (tracked by mod/size), and every search just compares
 cached vectors — typically a few **milliseconds**.
 
-### Module layout
+## The cache (SQLite)
+
+The cache is a single local SQLite file at `~/.phototrace/index.db` (override
+with `--cache`). It has two tables: `files` (path, mtime, size, indexed_at) and
+`faces` (a row per detected face: location box + 128-d embedding BLOB). Tracking
+`mtime`/`size` lets re-indexing process only new or changed files. Nothing
+leaves your machine. A pre-existing `index.pkl` from earlier versions is
+migrated into SQLite automatically the first time the new code opens it.
+
+## Module layout
 
 | File              | Responsibility                                              |
 |-------------------|-------------------------------------------------------------|
 | `engine.py`       | All face-recognition calls (swap here for InsightFace later)|
-| `cache.py`        | Persistent embedding cache (pickle now; SQLite in Stage 5)  |
+| `db.py`           | SQLite embedding cache (`FaceCache`); migrates old pickle   |
 | `phototrace.py`   | CLI: `index` and `search` commands                          |
-| `fileops.py`      | Safe move/copy (no overwrite, no delete, per-file errors)   |
-| `gui.py`          | PyQt6 desktop UI (Stage 3+)                                  |
+| `fileops.py`      | Safe move/copy + open-in-editor (no overwrite, no delete)   |
+| `gui.py`          | PyQt6 desktop UI                                            |
 | `stage1_match.py` | Stage 1 single-file proof (kept for reference)              |
+
+Concerns are separated so the recognition engine, the cache, file operations,
+and the UI can each change independently. In particular, swapping `engine.py`
+for a different recognition library (e.g. InsightFace) requires no changes
+elsewhere.
 
 ### Tuning the threshold
 

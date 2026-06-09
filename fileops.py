@@ -16,7 +16,10 @@ Design rules (matching the project's safety stance):
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -82,3 +85,23 @@ def move_files(paths, dest_dir: Path):
 def copy_files(paths, dest_dir: Path):
     """Copy each path into dest_dir. See _transfer for the return shape."""
     return _transfer(paths, dest_dir, move=False)
+
+
+def open_in_editor(path) -> None:
+    """
+    Open an image in the system's default application, cross-platform.
+
+    On Windows we ask for the "edit" verb first (opens the default *editor*,
+    e.g. Photos/Paint) and fall back to a normal open if that verb isn't
+    registered. macOS uses `open`, Linux uses `xdg-open`.
+    """
+    path = str(path)
+    if sys.platform.startswith("win"):
+        try:
+            os.startfile(path, "edit")        # type: ignore[attr-defined]
+        except OSError:
+            os.startfile(path)                # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.run(["open", path], check=False)
+    else:
+        subprocess.run(["xdg-open", path], check=False)

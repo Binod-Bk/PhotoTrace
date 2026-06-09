@@ -1,18 +1,23 @@
 """
-PhotoTrace — STAGE 4: file operations + live confidence slider
-==============================================================
+PhotoTrace — desktop UI (PyQt6)
+===============================
 
-Builds on the Stage 3 window:
+The full local app over the recognition engine (`engine.py`), the SQLite cache
+(`db.py`), and file operations (`fileops.py`):
 
-  * Per-image selection, plus Select all / Deselect all.
-  * MOVE or COPY the selected images to a folder you choose. Move asks for
-    confirmation first (it relocates files); copy does not.
-  * A live confidence slider that re-filters the displayed results instantly —
-    no re-search needed, because a search returns every candidate up to a cap
-    and the slider just changes which ones are shown.
+  * Pick 1-3 reference photos of ONE person and choose a folder.
+  * INDEX it (slow, once) — runs in a background thread with a progress bar.
+  * SEARCH (fast) — matches appear in a scrollable thumbnail grid, each with a
+    confidence score, a checkbox, an "Open" button (default editor), and a green
+    box around the matched face so group photos are easy to verify.
+  * A live confidence slider re-filters the shown results instantly (no
+    re-search: a search collects every candidate up to a cap, the slider just
+    changes which are displayed).
+  * Select all / Deselect all, then MOVE or COPY the selected images to a folder.
+    Move asks for confirmation first; there is no delete.
 
-Still: no delete (moving to a folder is the safe alternative), heavy work runs
-in background threads, and thumbnails load through Pillow so .webp/.avif render.
+Heavy work runs in QThread workers so the window never freezes. Thumbnails load
+through Pillow so .webp/.avif render even where Qt can't decode them natively.
 
 Run:
     python gui.py
@@ -24,8 +29,9 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal
-from PyQt6.QtGui import QIcon, QImage, QPixmap
+from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
@@ -34,8 +40,8 @@ from PyQt6.QtWidgets import (
 from PIL import Image
 
 import engine
-import cache as cache_mod
 import fileops
+from db import FaceCache, default_db_path
 
 THUMB_SIZE = 170        # px, square thumbnails in the results grid
 REF_THUMB_SIZE = 84     # px, small thumbnails for chosen references
@@ -52,17 +58,36 @@ SLIDER_MIN, SLIDER_MAX, SLIDER_DEFAULT = 30, 80, 60   # represent 0.30..0.80
 # Thumbnail loading (via Pillow so every supported format renders)
 # ---------------------------------------------------------------------------
 
-def load_thumbnail(path: Path, size: int) -> QPixmap | None:
-    """Load `path` and return a QPixmap no larger than size x size, or None."""
+def load_thumbnail(path: Path, size: int, highlight: tuple | None = None) -> QPixmap | None:
+    """
+    Load `path` and return a QPixmap no larger than size x size, or None.
+
+    If `highlight` is a (top, right, bottom, left) box in ORIGINAL image
+    coordinates, draw a green rectangle around it (scaled to the thumbnail) so
+    the user can see which face matched.
+    """
     try:
         im = Image.open(path)
+        orig_w, orig_h = im.size
         im.draft("RGB", (size, size))        # speeds up large JPEG decoding
         im = im.convert("RGB")
         im.thumbnail((size, size))
         data = im.tobytes("raw", "RGB")
         qimg = QImage(data, im.width, im.height, im.width * 3,
                       QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg.copy())
+        pix = QPixmap.fromImage(qimg.copy())
+
+        if highlight is not None and orig_w and orig_h:
+            top, right, bottom, left = highlight
+            sx, sy = pix.width() / orig_w, pix.height() / orig_h
+            painter = QPainter(pix)
+            pen = QPen(QColor(40, 200, 90))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.drawRect(int(left * sx), int(top * sy),
+                             int((right - left) * sx), int((bottom - top) * sy))
+            painter.end()
+        return pix
     except Exception:
         return None
 
@@ -84,31 +109,33 @@ class IndexWorker(QThread):
 
     def run(self):
         try:
-            cache = cache_mod.load_cache(self.cache_path)
+            cache = FaceCache(self.cache_path)
             images = [p for p in self.folder.rglob("*")
                       if p.is_file() and p.suffix.lower() in engine.SUPPORTED_EXTENSIONS]
             total = len(images)
             indexed = skipped = errors = faces_total = 0
 
             for i, img in enumerate(images, 1):
-                if cache_mod.is_cached_current(cache, img):
+                if cache.is_current(img):
                     skipped += 1
                 else:
                     try:
                         faces = engine.detect_faces(img)
-                        cache_mod.store_file(cache, img, faces)
+                        cache.upsert_file(img, faces)
                         indexed += 1
                         faces_total += len(faces)
                     except Exception:
                         errors += 1
                 self.progress.emit(i, total, str(img))
 
-            pruned = cache_mod.prune_missing(cache, under=self.folder)
-            cache_mod.save_cache(cache, self.cache_path)
+            pruned = cache.prune_missing(under=self.folder)
+            cache.commit()
+            total_cached = cache.file_count()
+            cache.close()
             self.done.emit({
                 "indexed": indexed, "skipped": skipped, "errors": errors,
                 "faces": faces_total, "pruned": pruned,
-                "total_cached": len(cache["files"]),
+                "total_cached": total_cached,
             })
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -120,7 +147,7 @@ class SearchWorker(QThread):
     whose best distance is <= SEARCH_CAP (sorted best-first) so the UI slider
     can re-filter live without re-searching.
     """
-    done = pyqtSignal(list, float)          # [(path, distance)], elapsed seconds
+    done = pyqtSignal(list, float)          # [(path, distance, location)], elapsed
     failed = pyqtSignal(str)
 
     def __init__(self, references: list[Path], cache_path: Path):
@@ -130,8 +157,9 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            cache = cache_mod.load_cache(self.cache_path)
-            if not cache["files"]:
+            cache = FaceCache(self.cache_path)
+            if cache.file_count() == 0:
+                cache.close()
                 self.failed.emit("The cache is empty. Index a folder first.")
                 return
 
@@ -141,6 +169,7 @@ class SearchWorker(QThread):
                 if enc is not None:
                     ref_encodings.append(enc)
             if not ref_encodings:
+                cache.close()
                 self.failed.emit("No usable face found in the reference image(s).")
                 return
 
@@ -148,14 +177,18 @@ class SearchWorker(QThread):
 
             start = time.perf_counter()
             candidates = []
-            for path_str, record in cache["files"].items():
-                if not record["faces"] or not Path(path_str).exists():
+            for path_str, faces in cache.iter_files():
+                if not faces or not Path(path_str).exists():
                     continue
-                encodings = [f["embedding"] for f in record["faces"]]
-                best = float(min(engine.face_distance(encodings, target)))
+                encodings = [emb for _loc, emb in faces]
+                distances = engine.face_distance(encodings, target)
+                best_idx = int(np.argmin(distances))
+                best = float(distances[best_idx])
                 if best <= SEARCH_CAP:
-                    candidates.append((path_str, best))
+                    # keep the location of the matched face for highlighting
+                    candidates.append((path_str, best, faces[best_idx][0]))
             elapsed = time.perf_counter() - start
+            cache.close()
 
             candidates.sort(key=lambda m: m[1])
             self.done.emit(candidates, elapsed)
@@ -175,9 +208,9 @@ class PhotoTraceWindow(QMainWindow):
 
         self.reference_paths: list[Path] = []
         self.target_folder: Path | None = None
-        self.cache_path = cache_mod.default_cache_path()
+        self.cache_path = default_db_path()
 
-        self.all_candidates: list[tuple[str, float]] = []   # full result set (<= cap)
+        self.all_candidates: list[tuple] = []   # (path, distance, location), <= cap
         self.visible_checks: list[tuple[str, QCheckBox]] = []  # currently shown cards
         self.selected_paths: set[str] = set()               # survives re-filtering
         self._thumb_cache: dict[str, QPixmap] = {}          # path -> grid pixmap
@@ -286,10 +319,12 @@ class PhotoTraceWindow(QMainWindow):
     def _threshold(self) -> float:
         return self.slider.value() / 100.0
 
-    def _thumb(self, path_str: str) -> QPixmap | None:
-        """Cached grid thumbnail so live re-filtering never re-reads from disk."""
+    def _thumb(self, path_str: str, highlight: tuple | None = None) -> QPixmap | None:
+        """Cached grid thumbnail (with matched-face box) so live re-filtering
+        never re-reads from disk."""
         if path_str not in self._thumb_cache:
-            self._thumb_cache[path_str] = load_thumbnail(Path(path_str), THUMB_SIZE)
+            self._thumb_cache[path_str] = load_thumbnail(
+                Path(path_str), THUMB_SIZE, highlight=highlight)
         return self._thumb_cache[path_str]
 
     # -- Reference handling -------------------------------------------------
@@ -395,11 +430,11 @@ class PhotoTraceWindow(QMainWindow):
         """Show only candidates within the current threshold. Cheap: reuses
         cached thumbnails and just rebuilds the grid widgets."""
         threshold = self._threshold()
-        shown = [(p, d) for (p, d) in self.all_candidates if d <= threshold]
+        shown = [c for c in self.all_candidates if c[1] <= threshold]
 
         self._clear_grid()
-        for idx, (path_str, distance) in enumerate(shown):
-            card = self._make_result_card(path_str, distance, threshold)
+        for idx, (path_str, distance, location) in enumerate(shown):
+            card = self._make_result_card(path_str, distance, location, threshold)
             self.results_grid.addWidget(card, idx // GRID_COLUMNS, idx % GRID_COLUMNS)
 
         ms = getattr(self, "_last_search_ms", 0.0)
@@ -415,7 +450,8 @@ class PhotoTraceWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-    def _make_result_card(self, path_str: str, distance: float, threshold: float) -> QWidget:
+    def _make_result_card(self, path_str: str, distance: float,
+                          location: tuple, threshold: float) -> QWidget:
         card = QFrame()
         card.setFrameShape(QFrame.Shape.StyledPanel)
         v = QVBoxLayout(card)
@@ -423,7 +459,7 @@ class PhotoTraceWindow(QMainWindow):
         thumb = QLabel()
         thumb.setFixedSize(THUMB_SIZE, THUMB_SIZE)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pix = self._thumb(path_str)
+        pix = self._thumb(path_str, highlight=location)   # green box on matched face
         thumb.setPixmap(pix) if pix else thumb.setText("(no preview)")
         v.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -432,13 +468,19 @@ class PhotoTraceWindow(QMainWindow):
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(info)
 
+        bottom = QHBoxLayout()
         check = QCheckBox(Path(path_str).name)
         check.setToolTip(path_str)
         check.setChecked(path_str in self.selected_paths)   # restore selection
         check.toggled.connect(lambda on, p=path_str: self._on_check(p, on))
-        v.addWidget(check)
-        self.visible_checks.append((path_str, check))
+        bottom.addWidget(check, stretch=1)
+        open_btn = QPushButton("Open")
+        open_btn.setToolTip("Open in the system's default editor")
+        open_btn.clicked.connect(lambda _=False, p=path_str: fileops.open_in_editor(p))
+        bottom.addWidget(open_btn)
+        v.addLayout(bottom)
 
+        self.visible_checks.append((path_str, check))
         return card
 
     def _on_check(self, path_str: str, on: bool):
@@ -496,7 +538,7 @@ class PhotoTraceWindow(QMainWindow):
         # and the current selection so the grid reflects reality.
         if move:
             moved = {str(src) for src, _ in succeeded}
-            self.all_candidates = [(p, d) for (p, d) in self.all_candidates if p not in moved]
+            self.all_candidates = [c for c in self.all_candidates if c[0] not in moved]
             self.selected_paths -= moved
             self._apply_filter()
 
