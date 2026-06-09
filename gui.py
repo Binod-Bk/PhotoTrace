@@ -54,7 +54,9 @@ MAX_REFERENCES = 3
 # A search returns every image whose best face distance is <= this cap; the
 # slider then filters within that set. Keeping a cap bounds how much we hold.
 SEARCH_CAP = 0.80
-SLIDER_MIN, SLIDER_MAX, SLIDER_DEFAULT = 30, 80, 60   # represent 0.30..0.80
+SLIDER_MIN, SLIDER_MAX, SLIDER_DEFAULT = 30, 80, 50   # represent 0.30..0.80
+                                                      # default 0.50 = stricter,
+                                                      # fewer false positives
 
 # Two themes (dark / light) sharing one indigo/violet accent. The stylesheet is
 # built once per palette from a template, then applied to the whole app via
@@ -206,38 +208,63 @@ def load_thumbnail(path: Path, size: int, highlight: tuple | None = None) -> QPi
 # ---------------------------------------------------------------------------
 
 class IndexWorker(QThread):
-    """Indexes a folder in the background, emitting progress as it goes."""
-    progress = pyqtSignal(int, int, str)   # done, total, current path
+    """Indexes one or more folders in the background, emitting progress."""
+    scanning = pyqtSignal()                 # walking folders (no count yet)
+    counted = pyqtSignal(int)               # total images found
+    progress = pyqtSignal(int, int, str)    # done, total, current path
     done = pyqtSignal(dict)                 # summary stats
     failed = pyqtSignal(str)
 
-    def __init__(self, folder: Path, cache_path: Path):
+    def __init__(self, folders: list[Path], cache_path: Path):
         super().__init__()
-        self.folder = folder
+        self.folders = folders
         self.cache_path = cache_path
 
     def run(self):
         try:
             cache = FaceCache(self.cache_path)
-            images = [p for p in self.folder.rglob("*")
-                      if p.is_file() and p.suffix.lower() in engine.SUPPORTED_EXTENSIONS]
-            total = len(images)
-            indexed = skipped = errors = faces_total = 0
 
-            for i, img in enumerate(images, 1):
+            # Phase 1: walk every folder and gather a de-duplicated file list.
+            # On huge trees this can take a while, so signal a busy state first.
+            self.scanning.emit()
+            seen: set[str] = set()
+            images: list[Path] = []
+            for folder in self.folders:
+                for p in folder.rglob("*"):
+                    key = str(p)
+                    if (key not in seen and p.is_file()
+                            and p.suffix.lower() in engine.SUPPORTED_EXTENSIONS):
+                        seen.add(key)
+                        images.append(p)
+            # Skip files already cached & unchanged so we only do real work.
+            skipped = 0
+            to_detect: list[Path] = []
+            for img in images:
                 if cache.is_current(img):
                     skipped += 1
                 else:
-                    try:
-                        faces = engine.detect_faces(img)
-                        cache.upsert_file(img, faces)
-                        indexed += 1
-                        faces_total += len(faces)
-                    except Exception:
-                        errors += 1
-                self.progress.emit(i, total, str(img))
+                    to_detect.append(img)
 
-            pruned = cache.prune_missing(under=self.folder)
+            total = len(to_detect)
+            self.counted.emit(total)
+
+            # Phase 2: detect faces in parallel across CPU cores; write results
+            # to the cache here in the worker thread as each one streams back.
+            indexed = errors = faces_total = 0
+            done = 0
+            for path_str, faces, err in engine.detect_many(to_detect):
+                done += 1
+                if err is None:
+                    cache.upsert_file(Path(path_str), faces)
+                    indexed += 1
+                    faces_total += len(faces)
+                else:
+                    errors += 1
+                self.progress.emit(done, total, path_str)
+
+            # Global prune only drops files that no longer exist on disk, so it's
+            # safe across multiple folders (other folders' files still exist).
+            pruned = cache.prune_missing()
             cache.commit()
             total_cached = cache.file_count()
             cache.close()
@@ -316,7 +343,7 @@ class PhotoTraceWindow(QMainWindow):
         self.resize(940, 760)
 
         self.reference_paths: list[Path] = []
-        self.target_folder: Path | None = None
+        self.target_folders: list[Path] = []
         self.cache_path = default_db_path()
 
         self.all_candidates: list[tuple] = []   # (path, distance, location), <= cap
@@ -346,9 +373,9 @@ class PhotoTraceWindow(QMainWindow):
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(22, 16, 22, 12)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
-        # --- Top bar: theme toggle (left, width-matched) + centered title ---
+        # === FIXED TOP: theme toggle + centered title + subtitle ===========
         topbar = QHBoxLayout()
         self.theme_btn = QPushButton("☀  Light")
         self.theme_btn.setFixedWidth(110)
@@ -371,6 +398,15 @@ class PhotoTraceWindow(QMainWindow):
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(subtitle)
 
+        # === SCROLLABLE MIDDLE: setup + actions + results ==================
+        # Everything here scrolls together, so when you scroll down to browse
+        # results, the setup controls move out of the way and the results use
+        # the whole viewport. Slider/ops/footer stay fixed below.
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(10)
+
         # --- 1. References ---
         ref_header = self._section_header("1  ·  Reference photos",
                                           "1–3 clear photos of the same person")
@@ -380,7 +416,7 @@ class PhotoTraceWindow(QMainWindow):
         self.clear_ref_btn.clicked.connect(self.clear_references)
         ref_header.addWidget(self.add_ref_btn)
         ref_header.addWidget(self.clear_ref_btn)
-        root.addLayout(ref_header)
+        col.addLayout(ref_header)
 
         self.ref_list = QListWidget()
         self.ref_list.setViewMode(QListWidget.ViewMode.IconMode)
@@ -388,62 +424,70 @@ class PhotoTraceWindow(QMainWindow):
         self.ref_list.setFixedHeight(REF_THUMB_SIZE + 44)
         self.ref_list.setSpacing(8)
         self.ref_list.setMovement(QListWidget.Movement.Static)
-        root.addWidget(self.ref_list)
+        col.addWidget(self.ref_list)
 
-        # --- 2. Folder ---
-        folder_header = self._section_header("2  ·  Folder to search")
-        root.addLayout(folder_header)
-        folder_row = QHBoxLayout()
-        self.folder_label = QLabel("No folder selected")
-        self.folder_label.setObjectName("muted")
-        self.folder_label.setMinimumWidth(360)
-        folder_row.addWidget(self.folder_label, stretch=1)
-        self.pick_folder_btn = QPushButton("Choose folder…")
-        self.pick_folder_btn.clicked.connect(self.pick_folder)
-        folder_row.addWidget(self.pick_folder_btn)
-        root.addLayout(folder_row)
+        # --- 2. Folders (one or more) ---
+        folder_header = self._section_header("2  ·  Folders to search",
+                                             "add one or more folders")
+        self.add_folder_btn = QPushButton("＋  Add folder…")
+        self.add_folder_btn.clicked.connect(self.add_folder)
+        self.remove_folder_btn = QPushButton("Remove")
+        self.remove_folder_btn.clicked.connect(self.remove_selected_folders)
+        self.clear_folders_btn = QPushButton("Clear")
+        self.clear_folders_btn.clicked.connect(self.clear_folders)
+        folder_header.addWidget(self.add_folder_btn)
+        folder_header.addWidget(self.remove_folder_btn)
+        folder_header.addWidget(self.clear_folders_btn)
+        col.addLayout(folder_header)
 
-        # --- 3. Actions (primary) ---
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
+        self.folder_list = QListWidget()
+        self.folder_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
+        self.folder_list.setFixedHeight(72)
+        self.folder_list.setToolTip("Tip: choose your photo folders, not whole "
+                                    "drives — scanning C:\\ wastes time on system images.")
+        col.addWidget(self.folder_list)
+
+        # --- 3. Index, its progress, Search, its progress (stacked) ---
         self.index_btn = QPushButton("Index folder")
         self.index_btn.setProperty("primary", True)
-        self.index_btn.setToolTip("Analyze the folder once (slow). Required before searching.")
+        self.index_btn.setToolTip("Analyze the folders once (slow). Required before searching.")
         self.index_btn.clicked.connect(self.start_index)
+        col.addWidget(self.index_btn)
+
+        self.index_progress = QProgressBar()
+        self.index_progress.setVisible(False)
+        col.addWidget(self.index_progress)
+
         self.search_btn = QPushButton("🔍  Search")
         self.search_btn.setProperty("primary", True)
         self.search_btn.clicked.connect(self.start_search)
-        action_row.addWidget(self.index_btn)
-        action_row.addWidget(self.search_btn)
-        action_row.addStretch()
-        root.addLayout(action_row)
+        col.addWidget(self.search_btn)
 
-        # --- Live confidence slider ---
-        filter_row = QHBoxLayout()
-        slabel = QLabel("Confidence threshold")
-        slabel.setObjectName("muted")
-        filter_row.addWidget(slabel)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(SLIDER_MIN, SLIDER_MAX)
-        self.slider.setValue(SLIDER_DEFAULT)
-        self.slider.setToolTip("Drag to re-filter results live. Lower = stricter.")
-        self.slider.valueChanged.connect(self._on_slider_changed)
-        filter_row.addWidget(self.slider, stretch=1)
-        self.slider_label = QLabel(f"{self._threshold():.2f}")
-        self.slider_label.setMinimumWidth(34)
-        filter_row.addWidget(self.slider_label)
-        root.addLayout(filter_row)
+        self.search_progress = QProgressBar()
+        self.search_progress.setVisible(False)
+        col.addWidget(self.search_progress)
 
-        # --- Progress + status ---
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        root.addWidget(self.progress)
-        self.status = QLabel("Ready — add reference photos and choose a folder to begin.")
+        # --- Results grid (the part that gets the whole window on scroll) ---
+        self.results_host = QWidget()
+        self.results_grid = QGridLayout(self.results_host)
+        self.results_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.results_grid.setSpacing(14)
+        self.results_grid.setContentsMargins(0, 4, 0, 0)
+        col.addWidget(self.results_host)
+        col.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        root.addWidget(scroll, stretch=1)
+
+        # === FIXED BOTTOM: status, file-ops, confidence slider (last) ======
+        self.status = QLabel("Ready — add reference photos and folders to begin.")
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
-        # --- Selection / file-ops toolbar ---
         ops_row = QHBoxLayout()
         ops_row.setSpacing(8)
         self.select_all_btn = QPushButton("Select all")
@@ -461,17 +505,24 @@ class PhotoTraceWindow(QMainWindow):
         ops_row.addWidget(self.move_btn)
         root.addLayout(ops_row)
 
-        # --- Results grid (scrollable) ---
-        self.results_host = QWidget()
-        self.results_grid = QGridLayout(self.results_host)
-        self.results_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.results_grid.setSpacing(14)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.results_host)
-        root.addWidget(scroll, stretch=1)
+        # Confidence slider lives last — it re-filters results live, so it's
+        # always reachable here while you scroll the results above.
+        filter_row = QHBoxLayout()
+        slabel = QLabel("Confidence threshold")
+        slabel.setObjectName("muted")
+        filter_row.addWidget(slabel)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(SLIDER_MIN, SLIDER_MAX)
+        self.slider.setValue(SLIDER_DEFAULT)
+        self.slider.setToolTip("Drag to re-filter results live. Lower = stricter.")
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        filter_row.addWidget(self.slider, stretch=1)
+        self.slider_label = QLabel(f"{self._threshold():.2f}")
+        self.slider_label.setMinimumWidth(34)
+        filter_row.addWidget(self.slider_label)
+        root.addLayout(filter_row)
 
-        # --- Footer: guide + source-code links ---
+        # === FIXED FOOTER: guide + source-code links =======================
         footer = QFrame()
         footer.setObjectName("footer")
         footer_row = QHBoxLayout(footer)
@@ -520,10 +571,12 @@ class PhotoTraceWindow(QMainWindow):
             "<ol style='margin-left:-18px; line-height:150%;'>"
             "<li><b>Add reference photos</b> — pick 1–3 clear, front-facing "
             "photos of the person you're looking for.</li>"
-            "<li><b>Choose a folder</b> — the folder of photos to search "
-            "(subfolders are included).</li>"
+            "<li><b>Add folders</b> — one or more folders of photos to search "
+            "(subfolders included). Tip: pick your photo folders, not whole "
+            "drives like C:\\ — that wastes time on system images.</li>"
             "<li><b>Index folder</b> — analyzes every photo once. The first run "
-            "is slow; after that it's cached and instant.</li>"
+            "is slow (you'll see a progress bar); after that it's cached and "
+            "instant.</li>"
             "<li><b>Search</b> — matches appear as thumbnails with a confidence "
             "score and a green box on the matched face (great for group photos).</li>"
             "<li><b>Confidence slider</b> — drag to loosen or tighten matches "
@@ -585,47 +638,101 @@ class PhotoTraceWindow(QMainWindow):
 
     # -- Folder handling ----------------------------------------------------
 
-    def pick_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose folder to search")
-        if folder:
-            self.target_folder = Path(folder)
-            self.folder_label.setText(str(self.target_folder))
-            self._refresh_status()
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Add a folder to search")
+        if not folder:
+            return
+        p = Path(folder)
+        if p in self.target_folders:
+            return
+        self.target_folders.append(p)
+        self.folder_list.addItem(QListWidgetItem(str(p)))
+        self._refresh_status()
+
+    def remove_selected_folders(self):
+        for item in self.folder_list.selectedItems():
+            row = self.folder_list.row(item)
+            self.folder_list.takeItem(row)
+            try:
+                self.target_folders.remove(Path(item.text()))
+            except ValueError:
+                pass
+        self._refresh_status()
+
+    def clear_folders(self):
+        self.target_folders.clear()
+        self.folder_list.clear()
+        self._refresh_status()
 
     def _refresh_status(self):
-        self.status.setText(
-            f"{len(self.reference_paths)} reference(s) · "
-            f"folder: {self.target_folder or '—'} · cache: {self.cache_path}")
+        n = len(self.target_folders)
+        folders = f"{n} folder(s)" if n else "no folders"
+        self._status(
+            f"{len(self.reference_paths)} reference(s) · {folders} selected.")
+
+    # -- Status line --------------------------------------------------------
+
+    def _status(self, text: str, success: bool = False):
+        """Set the status text; green when reporting a completed result."""
+        self.status.setText(text)
+        # Inline style overrides the muted QSS; cleared (=="") reverts to muted.
+        self.status.setStyleSheet(
+            "color: #16A34A; font-weight: 600;" if success else "")
+
+    # -- Busy indicator -----------------------------------------------------
+
+    @staticmethod
+    def _show_busy(bar: QProgressBar):
+        bar.setRange(0, 0)        # 0,0 = animated 'busy' mode
+        bar.setVisible(True)
+
+    @staticmethod
+    def _hide_progress(bar: QProgressBar):
+        bar.setVisible(False)
+        bar.setRange(0, 1)
 
     # -- Indexing -----------------------------------------------------------
 
     def start_index(self):
-        if not self.target_folder:
-            QMessageBox.warning(self, "PhotoTrace", "Choose a folder to index first.")
+        if not self.target_folders:
+            QMessageBox.warning(self, "PhotoTrace", "Add at least one folder to index.")
             return
         self._set_busy(True)
-        self.progress.setVisible(True)
-        self.progress.setValue(0)
-        self.status.setText("Indexing… detecting faces (first run can be slow).")
+        self._show_busy(self.index_progress)        # animated under the Index button
+        self._status("⏳  Scanning folders… please wait.")
 
-        self._worker = IndexWorker(self.target_folder, self.cache_path)
+        self._worker = IndexWorker(list(self.target_folders), self.cache_path)
+        self._worker.scanning.connect(
+            lambda: self._status("⏳  Scanning folders for images… please wait."))
+        self._worker.counted.connect(self._on_index_counted)
         self._worker.progress.connect(self._on_index_progress)
         self._worker.done.connect(self._on_index_done)
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
+    def _on_index_counted(self, total: int):
+        # Switch from the animated busy bar to a real 0..total progress bar.
+        self.index_progress.setRange(0, max(total, 1))
+        self.index_progress.setValue(0)
+        if total == 0:
+            self._status("✓ Everything already indexed — nothing new to do.",
+                         success=True)
+        else:
+            self._status(
+                f"⏳  {total} new/changed image(s) to process. Detecting faces…")
+
     def _on_index_progress(self, done: int, total: int, path: str):
-        self.progress.setMaximum(total)
-        self.progress.setValue(done)
-        self.status.setText(f"Indexing {done}/{total}: {Path(path).name}")
+        self.index_progress.setValue(done)
+        self._status(f"⏳  Indexing {done}/{total}: {Path(path).name}")
 
     def _on_index_done(self, stats: dict):
-        self.progress.setVisible(False)
+        self._hide_progress(self.index_progress)
         self._set_busy(False)
-        self.status.setText(
-            f"Index complete — {stats['indexed']} new ({stats['faces']} faces), "
+        self._status(
+            f"✓ Index complete — {stats['indexed']} new ({stats['faces']} faces), "
             f"{stats['skipped']} cached, {stats['errors']} unreadable, "
-            f"{stats['pruned']} pruned. Total cached: {stats['total_cached']}.")
+            f"{stats['pruned']} pruned. Total cached: {stats['total_cached']}.",
+            success=True)
 
     # -- Searching ----------------------------------------------------------
 
@@ -634,7 +741,8 @@ class PhotoTraceWindow(QMainWindow):
             QMessageBox.warning(self, "PhotoTrace", "Add at least one reference photo.")
             return
         self._set_busy(True)
-        self.status.setText("Searching…")
+        self._show_busy(self.search_progress)       # animated under the Search button
+        self._status("⏳  Searching… please wait.")
         self.selected_paths.clear()
         self._clear_grid()
 
@@ -644,6 +752,7 @@ class PhotoTraceWindow(QMainWindow):
         self._worker.start()
 
     def _on_search_done(self, candidates: list, elapsed: float):
+        self._hide_progress(self.search_progress)
         self._set_busy(False)
         self.all_candidates = candidates
         self._last_search_ms = elapsed * 1000
@@ -668,9 +777,10 @@ class PhotoTraceWindow(QMainWindow):
             self.results_grid.addWidget(card, idx // GRID_COLUMNS, idx % GRID_COLUMNS)
 
         ms = getattr(self, "_last_search_ms", 0.0)
-        self.status.setText(
-            f"Showing {len(shown)} of {len(self.all_candidates)} candidate(s) "
-            f"at threshold {threshold:.2f} · last search {ms:.0f} ms.")
+        self._status(
+            f"✓ Showing {len(shown)} of {len(self.all_candidates)} candidate(s) "
+            f"at threshold {threshold:.2f} · last search {ms:.0f} ms.",
+            success=len(shown) > 0)
 
     def _clear_grid(self):
         self.visible_checks.clear()
@@ -800,15 +910,16 @@ class PhotoTraceWindow(QMainWindow):
     # -- Shared helpers -----------------------------------------------------
 
     def _on_worker_failed(self, message: str):
-        self.progress.setVisible(False)
+        self._hide_progress(self.index_progress)
+        self._hide_progress(self.search_progress)
         self._set_busy(False)
         QMessageBox.critical(self, "PhotoTrace", message)
-        self.status.setText(f"Error: {message}")
+        self._status(f"Error: {message}")
 
     def _set_busy(self, busy: bool):
         for w in (self.index_btn, self.search_btn, self.add_ref_btn,
-                  self.clear_ref_btn, self.pick_folder_btn,
-                  self.copy_btn, self.move_btn):
+                  self.clear_ref_btn, self.add_folder_btn, self.remove_folder_btn,
+                  self.clear_folders_btn, self.copy_btn, self.move_btn):
             w.setEnabled(not busy)
 
 
@@ -821,4 +932,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required so multiprocessing worker processes (used for parallel indexing)
+    # don't relaunch the whole GUI — essential once frozen into an .exe.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

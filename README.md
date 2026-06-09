@@ -120,6 +120,24 @@ it once and caches `(file_path, face_location, embedding)` to disk. Re-indexing
 skips unchanged files (tracked by mod/size), and every search just compares
 cached vectors — typically a few **milliseconds**.
 
+## Indexing speed (CPU-only)
+
+Indexing is the expensive step. Three CPU-only optimizations (no GPU needed)
+keep it fast, and originals are never modified:
+
+- **Downscale for detection** — faces are *detected* on a downscaled copy
+  (`engine.MAX_DETECT_DIM`, default 800 px long edge), then *encoded* from the
+  full-resolution image. Detection time scales with pixels, so large photos and
+  screenshots get much faster with no loss of match accuracy.
+- **No upsampling** — the detector skips the expensive small-face upsample pass.
+- **Parallel detection** — files are detected across multiple CPU cores. Defaults
+  to half your logical cores (each worker loads its own copy of dlib, so this is
+  kept modest to protect RAM). Override with the `PHOTOTRACE_WORKERS` env var,
+  e.g. `set PHOTOTRACE_WORKERS=2` on a low-memory machine.
+
+**Tip:** index your actual photo folders (Pictures, camera, Downloads) — not
+whole drives like `C:\`, which are full of faceless system/app images.
+
 ## The cache (SQLite)
 
 The cache is a single local SQLite file at `~/.phototrace/index.db` (override

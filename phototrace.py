@@ -95,24 +95,26 @@ def cmd_index(args) -> int:
     errors = 0           # unreadable / corrupt
     total_faces = 0      # faces stored this run
 
+    # Skip already-cached files first, then detect the rest in parallel.
+    to_detect = []
     for image_path in iter_images(folder):
-        # Skip files we've already indexed and that haven't changed.
         if cache.is_current(image_path):
             skipped_cached += 1
-            continue
+        else:
+            to_detect.append(image_path)
 
-        try:
-            faces = engine.detect_faces(image_path)
-        except Exception as exc:
-            # Never let one bad file kill the whole index run.
+    workers = engine.default_workers()
+    print(f"Detecting faces in {len(to_detect)} file(s) "
+          f"using {workers} worker process(es)...\n")
+    for path_str, faces, err in engine.detect_many(to_detect, workers):
+        if err is not None:
             errors += 1
-            print(f"  [skip] {image_path}  ({exc})")
+            print(f"  [skip] {path_str}  ({err})")
             continue
-
-        cache.upsert_file(image_path, faces)
+        cache.upsert_file(Path(path_str), faces)
         indexed += 1
         total_faces += len(faces)
-        print(f"  [index] {len(faces)} face(s)  {image_path}")
+        print(f"  [index] {len(faces)} face(s)  {path_str}")
 
     # Forget files that were deleted from disk since last index.
     pruned = cache.prune_missing(under=folder)
@@ -264,4 +266,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # safe parallel indexing (incl. frozen exe)
     sys.exit(main())
